@@ -287,7 +287,11 @@ static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
             continue;
         }
 
-        if (mr.p0 < cmp.p1 && mr.p1 >= cmp.p0) {
+        // ranges are half-open [p0, p1): with `>=` a range that ends exactly where the other begins counts as an
+        // overlap, so two mat-vecs whose dst sits right after their shared src1 (ffn_gate / ffn_up, Q / K / V) get a
+        // barrier between them. GGML_METAL_MEMRANGE_HALFOPEN=1 tests p1 > p0 instead.
+        static const bool halfopen = getenv("GGML_METAL_MEMRANGE_HALFOPEN") && atoi(getenv("GGML_METAL_MEMRANGE_HALFOPEN")) == 1;
+        if (mr.p0 < cmp.p1 && (halfopen ? mr.p1 > cmp.p0 : mr.p1 >= cmp.p0)) {
             if (mrs->debug > 2) {
                 GGML_LOG_DEBUG("%s: the %s range buf=%lld, [%lld, %lld) overlaps with a previous %s range buf=%lld, [%lld, %lld)\n",
                         __func__,

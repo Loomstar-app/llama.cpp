@@ -229,6 +229,15 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 return 1;
             }
         }
+        // GGML_METAL_SKIP_NAMES=<prefix>[,<prefix>...]: the same by node name prefix (e.g. ffn_up,ffn_gate)
+        static const std::string skipn = getenv("GGML_METAL_SKIP_NAMES") ? std::string(getenv("GGML_METAL_SKIP_NAMES")) + "," : "";
+        if (!skipn.empty()) {
+            for (size_t a = 0, b; (b = skipn.find(',', a)) != std::string::npos; a = b + 1) {
+                if (b > a && strncmp(node->name, skipn.c_str() + a, b - a) == 0) {
+                    return 1;
+                }
+            }
+        }
     }
 
     switch (node->op) {

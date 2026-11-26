@@ -1582,11 +1582,11 @@ kernel void kernel_mul_mv_pq2_0_f32_sn(
     const int nb        = args.ne00/QK_PQ2_0;
     const int first_row = tgpig.x*nr0;
 
-    device const block_pq2_0 * ax[nr0];
-    FOR_UNROLL (short row = 0; row < nr0; ++row) {
-        const int r = min(first_row + row, args.ne01 - 1); // tail rows read the last row, write nothing
-        ax[row] = (device const block_pq2_0 *) (src0 + (uint64_t) r*args.nb01);
-    }
+    // one base pointer and 32-bit row offsets, not nr0 64-bit pointers: the registers it frees buy occupancy, which is
+    // what hides the load latency here (10240x5120: 110 -> 86 us). Tail rows re-read the last row and write nothing.
+    const uint rowb = (uint) args.nb01;
+    device const char * base = src0 + (uint64_t) first_row*args.nb01;
+    const int nrow_valid = args.ne01 - first_row;
 
     device const float * y = (device const float *) src1;
 
@@ -1603,11 +1603,13 @@ kernel void kernel_mul_mv_pq2_0_f32_sn(
             yl[j] = yb[j];
             sumy += yl[j];
         }
+        const uint ob = (uint) ib*sizeof(block_pq2_0);
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            device const block_pq2_0 * qb = ax[row] + ib;
-            device const ushort * qs = (device const ushort *) (qb->qs + il/4);
+            device const char * pb = base + ((uint) min((int) row, nrow_valid - 1)*rowb + ob);
+            const float d = (float) *((device const half *) pb);
+            device const ushort * qs = (device const ushort *) (pb + sizeof(half) + il/4);
             const uint w = (uint) qs[0] | ((uint) qs[1] << 16);
-            sumf[row] += (float) qb->d * (pq2_dot_subn(w, yl) - sumy);
+            sumf[row] += d * (pq2_dot_subn(w, yl) - sumy);
         }
     }
 

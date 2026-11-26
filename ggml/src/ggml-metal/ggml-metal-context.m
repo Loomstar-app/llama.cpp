@@ -253,7 +253,11 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 
 // GGML_METAL_GPU_TIMES diagnostics (see ggml_metal_synchronize)
 static double g_gt_span = 0, g_gt_busy = 0, g_gt_t0 = 0, g_gt_t1 = 0, g_gt_wall0 = 0, g_gt_wall = 0; static long g_gt_n = 0;
+static double g_gc_t = 0, g_gc_lat = 0, g_gc_wake = 0, g_gc_cpu = 0, g_gc_enc = 0, g_gc_t_end = 0; static long g_gc_n = 0;
+static double ggml_metal_now(void) { return (double) clock_gettime_nsec_np(CLOCK_UPTIME_RAW)*1e-9; }
 static void ggml_metal_gpu_times_dump(void) {
+    if (g_gc_n > 0) fprintf(stderr, "GGML_METAL_GPU_TIMES: %ld graphs: compute() entry -> GPU start %.3f ms, encode in compute() %.3f ms, GPU end -> sync return %.3f ms, sync return -> next compute() %.3f ms (avg)\n",
+        g_gc_n, 1e3*g_gc_lat/g_gc_n, 1e3*g_gc_enc/g_gc_n, 1e3*g_gc_wake/g_gc_n, 1e3*g_gc_cpu/(g_gc_n > 1 ? g_gc_n - 1 : 1));
     if (g_gt_n > 0) fprintf(stderr, "GGML_METAL_GPU_TIMES: %ld syncs, GPU span %.3f ms, GPU busy %.3f ms, wall between syncs %.3f ms (avg)\n",
         g_gt_n, 1e3*g_gt_span/g_gt_n, 1e3*g_gt_busy/g_gt_n, 1e3*g_gt_wall/(g_gt_n > 1 ? g_gt_n - 1 : 1));
 }
@@ -263,6 +267,12 @@ static void ggml_metal_gpu_times_add(bool first, bool last, double t0, double t1
     if (first) { g_gt_t0 = t0; g_gt_t1 = t1; }
     g_gt_t0 = t0 < g_gt_t0 ? t0 : g_gt_t0; g_gt_t1 = t1 > g_gt_t1 ? t1 : g_gt_t1;
     g_gt_busy += t1 - t0;
+    if (last && g_gc_t > 0) {
+        const double now = ggml_metal_now();
+        g_gc_lat  += g_gt_t0 - g_gc_t;
+        g_gc_wake += now - g_gt_t1;
+        g_gc_n++; g_gc_t = 0; g_gc_t_end = now;
+    }
     if (last) {
         g_gt_span += g_gt_t1 - g_gt_t0; 
         const double now = (double) clock_gettime_nsec_np(CLOCK_UPTIME_RAW)*1e-9;
@@ -505,6 +515,10 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    static int gpu_times = -1;
+    if (gpu_times < 0) gpu_times = getenv("GGML_METAL_GPU_TIMES") != NULL;
+    const double t_gc0 = gpu_times ? ggml_metal_now() : 0;
+    if (gpu_times) { if (g_gc_t_end > 0) g_gc_cpu += t_gc0 - g_gc_t_end; g_gc_t = t_gc0; }
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -674,6 +688,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        if (gpu_times) { g_gc_enc += ggml_metal_now() - t_gc0; }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
