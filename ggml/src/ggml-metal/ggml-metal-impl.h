@@ -1329,6 +1329,14 @@ typedef struct {
     int32_t n_blk; // sign rows per activation row (K / N); 0 = no sign flip fused in
 } ggml_metal_kargs_fwht;
 
+// GGML_METAL_ADD_NORM_FWHT: ADD + RMS_NORM + MUL (norm weight) + MUL (Hadamard signs) + FWHT on one row
+typedef struct {
+    int32_t n4;    // row length / 4
+    int32_t n;     // row length
+    int32_t n_blk; // row length / 1024
+    float   eps;
+} ggml_metal_kargs_add_norm_fwht;
+
 typedef struct {
     int64_t  ne0;
     float    start;
