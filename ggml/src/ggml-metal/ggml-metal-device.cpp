@@ -1341,6 +1341,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                         snprintf(ptq1_suffix, sizeof(ptq1_suffix), "_nr1_%d_r%d", nr1, nr0);
                         suffix = ptq1_suffix;
                     }
+                    // GGML_METAL_PQ2_U16=1: decode (1 src1 row) on the ushort-load variant of the stock kernel,
+                    // bit-identical; GGML_METAL_PQ2_U16_NR0 (1, 2, 4, 8) rows per simdgroup, _NSG (1..8) simdgroups.
+                    static const bool u16_on = getenv("GGML_METAL_PQ2_U16") && atoi(getenv("GGML_METAL_PQ2_U16")) == 1;
+                    if (u16_on && nr1 == 1 && ne11 == 1) {
+                        static const int u16_nr0 = getenv("GGML_METAL_PQ2_U16_NR0") ? atoi(getenv("GGML_METAL_PQ2_U16_NR0")) : N_R0_PQ2_0;
+                        static const int u16_nsg = getenv("GGML_METAL_PQ2_U16_NSG") ? atoi(getenv("GGML_METAL_PQ2_U16_NSG")) : N_SG_PQ2_0;
+                        nr0 = (u16_nr0 == 1 || u16_nr0 == 2 || u16_nr0 == 4) ? u16_nr0 : 8;
+                        nsg = (u16_nsg >= 1 && u16_nsg <= 8) ? u16_nsg : N_SG_PQ2_0;
+                        snprintf(ptq1_suffix, sizeof(ptq1_suffix), "_u16_r%d", nr0);
+                        suffix = ptq1_suffix;
+                    }
                 }
             } break;
         case GGML_TYPE_PTQ1_0:

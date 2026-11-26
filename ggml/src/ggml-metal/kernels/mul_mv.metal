@@ -1301,6 +1301,29 @@ inline float q2_dot_coeffs(device const block_t * qb, float sumy, thread const f
     return qb->d * (acc - sumy);
 }
 
+// GGML_METAL_PQ2_U16=1 (decode, 1 src1 row): same arithmetic as q2_dot_coeffs, bit for bit, but the lane's 4 code
+// bytes come in as 2 ushort loads instead of 4 byte loads. The qs of a PQ2_0 block sit at offset 2 of a 34-byte block,
+// so they are always 2-byte aligned and never 4-byte aligned for every other block.
+inline float pq2_dot_coeffs_u16(device const block_pq2_0 * qb, float sumy, thread const float * c, int il) {
+    device const ushort * qs = (device const ushort *) (qb->qs + (il / 4));
+    const ushort w0 = qs[0];
+    const ushort w1 = qs[1];
+    const float bb[4] = { (float) (w0 & 0xFF), (float) (w0 >> 8), (float) (w1 & 0xFF), (float) (w1 >> 8) };
+
+    float acc = 0.f;
+
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const float b = bb[j];
+        const float u = b * (1.0f/256.0f);
+        acc += floor( 4.0f*u)*c[4*j + 0];
+        acc += floor(16.0f*u)*c[4*j + 1];
+        acc += floor(64.0f*u)*c[4*j + 2];
+        acc +=              b*c[4*j + 3];
+    }
+
+    return qb->d * (acc - sumy);
+}
+
 template <int nr1, typename block_t>
 inline void pq2_0_dot_multicol(
         device const block_t * qb,
@@ -1422,6 +1445,102 @@ kernel void kernel_mul_mv_pq2_0_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
+
+template<int nr0, typename args_t>
+void kernel_mul_mv_pq2_0_f32_u16_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK_PQ2_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_pq2_0 * ax[nr0];
+    for (int row = 0; row < nr0; ++row) {
+        const uint64_t offset0 = (first_row + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        ax[row] = (device const block_pq2_0 *) ((device char *) src0 + offset0);
+    }
+
+    float yl[16];
+    float sumf[nr0] = {0.f};
+
+    // group 128: 8 sub-blocks of 16 weights per PQ2_0 block
+    const short ix = (tiisg/8);
+    const short il = (tiisg%8)*16;
+
+    device const float * yb = y + ix*QK_PQ2_0 + il;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
+        // stage the 16 activations once as base-4 collapse coefficients, reused per row;
+        // the floor chain yields fields top down, so the coefficients pair y_3 with g_1
+        float sumy = 0.f;
+
+        FOR_UNROLL (short j = 0; j < 4; j++) {
+            const float y0 = yb[4*j + 0];
+            const float y1 = yb[4*j + 1];
+            const float y2 = yb[4*j + 2];
+            const float y3 = yb[4*j + 3];
+            sumy += (y0 + y1) + (y2 + y3);
+            yl[4*j + 0] = y3 - 4.0f*y2;
+            yl[4*j + 1] = y2 - 4.0f*y1;
+            yl[4*j + 2] = y1 - 4.0f*y0;
+            yl[4*j + 3] = y0;
+        }
+
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            sumf[row] += pq2_dot_coeffs_u16(ax[row] + ib, sumy, yl, il);
+        }
+
+        yb += QK_PQ2_0 * (N_SIMDWIDTH/8);
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst_f32[first_row + row] = tot;
+        }
+    }
+}
+
+template<int nr0>
+kernel void kernel_mul_mv_pq2_0_f32_u16(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_pq2_0_f32_u16_impl<nr0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_pq2_0_f32_u16<8>) mul_mv_pq2_0_u16_t;
+template [[host_name("kernel_mul_mv_pq2_0_f32_u16_r1")]] kernel mul_mv_pq2_0_u16_t kernel_mul_mv_pq2_0_f32_u16<1>;
+template [[host_name("kernel_mul_mv_pq2_0_f32_u16_r2")]] kernel mul_mv_pq2_0_u16_t kernel_mul_mv_pq2_0_f32_u16<2>;
+template [[host_name("kernel_mul_mv_pq2_0_f32_u16_r4")]] kernel mul_mv_pq2_0_u16_t kernel_mul_mv_pq2_0_f32_u16<4>;
+template [[host_name("kernel_mul_mv_pq2_0_f32_u16_r8")]] kernel mul_mv_pq2_0_u16_t kernel_mul_mv_pq2_0_f32_u16<8>;
+
 
 // 2-bit coefficient pre-pass (GGML_METAL_PQ2_COEF, 1..3 rows): the activations are staged once per column as base-4
 // collapse coefficients, the same float arithmetic as the stock PQ2_0 kernels at 1..3 rows.
