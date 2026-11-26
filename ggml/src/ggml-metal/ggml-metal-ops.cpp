@@ -218,6 +218,19 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
+    // GGML_METAL_SKIP_OPS=<op>[,<op>...] (timing diagnostics only, the results are garbage): do not encode nodes of
+    // these ops (ggml_op_desc names; MUL_MAT_PQ2 = PQ2_0 mat-muls only), to measure what the rest of a graph costs
+    {
+        static const std::string skip = getenv("GGML_METAL_SKIP_OPS") ? std::string(",") + getenv("GGML_METAL_SKIP_OPS") + "," : "";
+        if (!skip.empty()) {
+            const bool pq2 = node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->type == GGML_TYPE_PQ2_0;
+            if (skip.find(std::string(",") + ggml_op_desc(node) + ",") != std::string::npos ||
+                (pq2 && skip.find(",MUL_MAT_PQ2,") != std::string::npos)) {
+                return 1;
+            }
+        }
+    }
+
     switch (node->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -3030,6 +3043,44 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
+
+    // GGML_METAL_PQ2_SN=1: PQ2_0 decode (1 src1 row, 2D) on kernel_mul_mv_pq2_0_f32_sn (fp16-subnormal decode, split-K
+    // across the threadgroup's simdgroups). Not bit-identical to the stock kernel (see the kernel's comment).
+    // GGML_METAL_PQ2_SN_NR0 (4, 8, 16) rows per threadgroup, GGML_METAL_PQ2_SN_NSG simdgroups (default 4 when K >= 16384,
+    // else 2). Measured on M2 Pro 16-core.
+    {
+        static const bool sn_on  = getenv("GGML_METAL_PQ2_SN") && atoi(getenv("GGML_METAL_PQ2_SN")) == 1;
+        static const int  sn_nr0 = getenv("GGML_METAL_PQ2_SN_NR0") ? atoi(getenv("GGML_METAL_PQ2_SN_NR0")) : 8;
+        static const int  sn_nsg = getenv("GGML_METAL_PQ2_SN_NSG") ? atoi(getenv("GGML_METAL_PQ2_SN_NSG")) : 0;
+        const ggml_tensor * s0 = op->src[0];
+        const ggml_tensor * s1 = op->src[1];
+        if (sn_on && s0->type == GGML_TYPE_PQ2_0 && s1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+            s1->ne[1] == 1 && s0->ne[2] == 1 && s0->ne[3] == 1 && s1->ne[2] == 1 && s1->ne[3] == 1 &&
+            s0->ne[0] % 128 == 0 && s1->nb[0] == sizeof(float) && s0->nb[1] % 2 == 0 && ggml_is_contiguous(op)) {
+            const int nr0 = (sn_nr0 == 4 || sn_nr0 == 16) ? sn_nr0 : 8;
+            const int nsg = (sn_nsg >= 1 && sn_nsg <= 8) ? sn_nsg : (s0->ne[0] >= 16384 ? 4 : 2);
+
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mv_pq2_sn(lib, nr0, nsg);
+
+            ggml_metal_kargs_mul_mv args = {};
+            args.ne00 = (int32_t) s0->ne[0];
+            args.ne01 = (int32_t) s0->ne[1];
+            args.nb01 = s0->nb[1];
+            args.ne0  = (int32_t) op->ne[0];
+            args.ne1  = (int32_t) op->ne[1];
+            args.nr0  = nr0;
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(s0), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(s1), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 3);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((s0->ne[1] + nr0 - 1)/nr0), 1, 1, 32, nsg, 1);
+
+            return 1;
+        }
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);

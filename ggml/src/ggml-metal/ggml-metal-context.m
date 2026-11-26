@@ -251,6 +251,26 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+// GGML_METAL_GPU_TIMES diagnostics (see ggml_metal_synchronize)
+static double g_gt_span = 0, g_gt_busy = 0, g_gt_t0 = 0, g_gt_t1 = 0, g_gt_wall0 = 0, g_gt_wall = 0; static long g_gt_n = 0;
+static void ggml_metal_gpu_times_dump(void) {
+    if (g_gt_n > 0) fprintf(stderr, "GGML_METAL_GPU_TIMES: %ld syncs, GPU span %.3f ms, GPU busy %.3f ms, wall between syncs %.3f ms (avg)\n",
+        g_gt_n, 1e3*g_gt_span/g_gt_n, 1e3*g_gt_busy/g_gt_n, 1e3*g_gt_wall/(g_gt_n > 1 ? g_gt_n - 1 : 1));
+}
+static void ggml_metal_gpu_times_add(bool first, bool last, double t0, double t1) {
+    static bool reg = false; if (!reg) { atexit(ggml_metal_gpu_times_dump); reg = true; }
+    // cmd_bufs are visited 0..n_cb; the main buffer (index n_cb) runs first on the GPU
+    if (first) { g_gt_t0 = t0; g_gt_t1 = t1; }
+    g_gt_t0 = t0 < g_gt_t0 ? t0 : g_gt_t0; g_gt_t1 = t1 > g_gt_t1 ? t1 : g_gt_t1;
+    g_gt_busy += t1 - t0;
+    if (last) {
+        g_gt_span += g_gt_t1 - g_gt_t0; 
+        const double now = (double) clock_gettime_nsec_np(CLOCK_UPTIME_RAW)*1e-9;
+        if (g_gt_n > 0) g_gt_wall += now - g_gt_wall0;
+        g_gt_wall0 = now; g_gt_n++;
+    }
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
@@ -269,6 +289,15 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             }
 
             MTLCommandBufferStatus status = [cmd_buf status];
+            // GGML_METAL_GPU_TIMES=1: per synchronize, the GPU span (first start .. last end) and busy time of the
+            // graph's command buffers, averaged and printed at exit (decode diagnostics; costs nothing when unset)
+            {
+                static int gpu_times = -1;
+                if (gpu_times < 0) gpu_times = getenv("GGML_METAL_GPU_TIMES") != NULL;
+                if (gpu_times && status == MTLCommandBufferStatusCompleted) {
+                    ggml_metal_gpu_times_add(cb_idx == 0, cb_idx == n_cb, cmd_buf.GPUStartTime, cmd_buf.GPUEndTime);
+                }
+            }
             if (status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
                 if (status == MTLCommandBufferStatusError) {

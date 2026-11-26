@@ -1542,6 +1542,98 @@ template [[host_name("kernel_mul_mv_pq2_0_f32_u16_r4")]] kernel mul_mv_pq2_0_u16
 template [[host_name("kernel_mul_mv_pq2_0_f32_u16_r8")]] kernel mul_mv_pq2_0_u16_t kernel_mul_mv_pq2_0_f32_u16<8>;
 
 
+// GGML_METAL_PQ2_SN=1 (decode, 1 src1 row, 2D src0): PQ2_0 mat-vec decoded through fp16 subnormals. A 2-bit code q
+// masked into mantissa bits 0-1 of a half is the subnormal q*2^-24, at bits 8-9 it is q*2^-16: both exact, with no
+// offset to cancel later, and the half operand widens to fp32 for free inside the fma. One shift of the lane's 32-bit
+// word, x = w >> 2f, holds field f of bytes 0 and 2 at bits 0-1 / 16-17 and of bytes 1 and 3 at bits 8-9 / 24-25, so
+// two ands give two half2 = four weights: ~0.75 integer ops and one fma per weight, against ~2 ops and one fma for
+// the floor chain of q2_dot_coeffs. The kernel is ALU-bound on M2 Pro (stock 187 us at 17408x5120 vs 126 us for its
+// loads alone); this one runs near the 185 GB/s read peak.
+// Threadgroup layout: nr0 rows per threadgroup, its nsg simdgroups split K (every nsg-th group of 4 blocks) and
+// reduce through threadgroup memory. Lanes as in the stock kernel: 8 lanes per block, 16 weights (4 bytes) each.
+// Not bit-identical to the stock kernel: same exact products, different summation order and no floor-chain rounding
+// (max abs error against an fp64 reference ~3e-7 vs ~8e-6 for the stock kernel at K=5120).
+inline float pq2_dot_subn(uint w, thread const float * y) {
+    float al = 0.f; // bytes 0, 2: q * 2^-24
+    float ah = 0.f; // bytes 1, 3: q * 2^-16
+    FOR_UNROLL (short f = 0; f < 4; f++) {
+        const uint  x  = w >> (2*f);
+        const half2 lo = as_type<half2>(x & 0x00030003u);
+        const half2 hi = as_type<half2>(x & 0x03000300u);
+        al = fma((float) lo[0], y[0*4 + f], al);
+        ah = fma((float) hi[0], y[1*4 + f], ah);
+        al = fma((float) lo[1], y[2*4 + f], al);
+        ah = fma((float) hi[1], y[3*4 + f], ah);
+    }
+    return fma(al, 16777216.0f, ah*65536.0f);
+}
+
+template<int nr0>
+kernel void kernel_mul_mv_pq2_0_f32_sn(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]]) {
+    const int nb        = args.ne00/QK_PQ2_0;
+    const int first_row = tgpig.x*nr0;
+
+    device const block_pq2_0 * ax[nr0];
+    FOR_UNROLL (short row = 0; row < nr0; ++row) {
+        const int r = min(first_row + row, args.ne01 - 1); // tail rows read the last row, write nothing
+        ax[row] = (device const block_pq2_0 *) (src0 + (uint64_t) r*args.nb01);
+    }
+
+    device const float * y = (device const float *) src1;
+
+    const short ix = tiisg/8;
+    const short il = (tiisg%8)*16;
+
+    float yl[16];
+    float sumf[nr0] = { 0.f };
+
+    for (int ib = ix + 4*sgitg; ib < nb; ib += 4*nsg) {
+        device const float * yb = y + ib*QK_PQ2_0 + il;
+        float sumy = 0.f;
+        FOR_UNROLL (short j = 0; j < 16; j++) {
+            yl[j] = yb[j];
+            sumy += yl[j];
+        }
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            device const block_pq2_0 * qb = ax[row] + ib;
+            device const ushort * qs = (device const ushort *) (qb->qs + il/4);
+            const uint w = (uint) qs[0] | ((uint) qs[1] << 16);
+            sumf[row] += (float) qb->d * (pq2_dot_subn(w, yl) - sumy);
+        }
+    }
+
+    FOR_UNROLL (short row = 0; row < nr0; row++) {
+        const float t = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            shmem[sgitg*nr0 + row] = t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg < nr0 && first_row + tiisg < args.ne01) {
+        float t = 0.f;
+        for (short s = 0; s < nsg; s++) {
+            t += shmem[s*nr0 + tiisg];
+        }
+        ((device float *) dst)[first_row + tiisg] = t;
+    }
+}
+
+typedef decltype(kernel_mul_mv_pq2_0_f32_sn<8>) mul_mv_pq2_0_sn_t;
+template [[host_name("kernel_mul_mv_pq2_0_f32_sn_r4")]]  kernel mul_mv_pq2_0_sn_t kernel_mul_mv_pq2_0_f32_sn<4>;
+template [[host_name("kernel_mul_mv_pq2_0_f32_sn_r8")]]  kernel mul_mv_pq2_0_sn_t kernel_mul_mv_pq2_0_f32_sn<8>;
+template [[host_name("kernel_mul_mv_pq2_0_f32_sn_r16")]] kernel mul_mv_pq2_0_sn_t kernel_mul_mv_pq2_0_f32_sn<16>;
+
+
 // 2-bit coefficient pre-pass (GGML_METAL_PQ2_COEF, 1..3 rows): the activations are staged once per column as base-4
 // collapse coefficients, the same float arithmetic as the stock PQ2_0 kernels at 1..3 rows.
 // Layout per column and block: [it*16 + j] the 16 base-4 collapse coefficients of thread it (il = 16*it),
