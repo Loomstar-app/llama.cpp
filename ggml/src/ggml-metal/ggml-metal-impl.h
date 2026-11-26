@@ -967,6 +967,16 @@ typedef struct {
     uint64_t nb2;
 } ggml_metal_kargs_ssm_conv;
 
+// GGML_METAL_CONV_FOLD: CONCAT(state, x) + CPY(new state) + SSM_CONV in one dispatch, 1 token, d_conv = 4
+typedef struct {
+    int32_t  nr;    // channels
+    uint64_t nbs0;  // state: time stride
+    uint64_t nbs1;  // state: channel stride
+    uint64_t nbx1;  // x: channel stride
+    uint64_t nbw1;  // conv weight: channel stride
+    uint64_t nb0;   // output: channel stride
+} ggml_metal_kargs_ssm_conv_fold;
+
 typedef struct {
     int64_t  d_state;
     int64_t  d_inner;

@@ -586,6 +586,41 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     //
     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
 
+    // GGML_METAL_PROGRESSIVE=<first>: encode the graph on this thread in growing chunks (first, 3*first, 9*first, ...)
+    // and commit each one as soon as it is encoded. The GPU starts after <first> nodes instead of max(64, 10%), and
+    // since encoding a node is ~15x faster than running it, the later chunks are always ready before the GPU needs them.
+    {
+        static int prog = -1;
+        if (prog < 0) prog = getenv("GGML_METAL_PROGRESSIVE") ? MAX(1, atoi(getenv("GGML_METAL_PROGRESSIVE"))) : 0;
+        if (prog > 0 && ctx->capture_compute != 1 && !ctx->capture_started) {
+            @autoreleasepool {
+                id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+                int pos = 0, len = prog;
+                while (pos < gf->n_nodes) {
+                    const int end = MIN(gf->n_nodes, pos + len);
+                    id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+                    ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, pos, end,
+                            ctx->use_concurrency, false, ctx->debug_graph);
+                    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                        const int res = ggml_metal_op_encode(ctx_op, idx);
+                        if (res == 0) {
+                            break;
+                        }
+                        idx += res - 1;
+                    }
+                    ggml_metal_op_free(ctx_op);
+                    [cmd_buf commit];
+                    [cmd_buf retain];
+                    [ctx->cmd_bufs_ext addObject:cmd_buf];
+                    ctx->cmd_buf_last = cmd_buf;
+                    pos = end;
+                    len *= 3;
+                }
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
     @autoreleasepool {
         ctx->gf = gf;
 

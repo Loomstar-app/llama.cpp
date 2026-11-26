@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <mutex>
 #include <cstdio>
 
@@ -140,6 +141,11 @@ private:
 
     // SET_ROWS nodes whose scatter a preceding GDN dispatch already performed
     std::unordered_set<const ggml_tensor *> fused_set_rows;
+
+public:
+    // GGML_METAL_CONV_FOLD: CONCAT node -> the CPY whose state write the SSM_CONV dispatch performs; both are skipped
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> conv_fold;
+    std::unordered_set<const ggml_tensor *> conv_fold_skip;
 };
 
 ggml_metal_op_t ggml_metal_op_init(
@@ -202,6 +208,58 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
+static bool ggml_metal_conv_fold_detect(ggml_metal_op_t ctx, int idx) {
+    static const bool on = getenv("GGML_METAL_CONV_FOLD") && atoi(getenv("GGML_METAL_CONV_FOLD")) == 1;
+    if (!on) {
+        return false;
+    }
+    const ggml_tensor * cat = ctx->node(idx);
+    const ggml_tensor * st  = cat->src[0];
+    const ggml_tensor * x   = cat->src[1];
+    if (ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || !st || !x ||
+        st->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        cat->ne[0] != 4 || st->ne[0] != 3 || x->ne[0] != 1 || st->ne[1] != cat->ne[1] || x->ne[1] != cat->ne[1] ||
+        cat->ne[2] != 1 || cat->ne[3] != 1 || !ggml_is_contiguous(cat)) {
+        return false;
+    }
+    const ggml_tensor * cpy = nullptr;
+    const ggml_tensor * ssm = nullptr;
+    for (int j = idx + 1; j < ctx->n_nodes() && (!cpy || !ssm); ++j) {
+        const ggml_tensor * n = ctx->node(j);
+        if (!cpy && n->op == GGML_OP_CPY && n->src[0] && n->src[0]->view_src == cat) {
+            const ggml_tensor * v = n->src[0];
+            if (v->type != GGML_TYPE_F32 || v->view_offs != sizeof(float) || v->ne[0] != 3 || v->ne[1] != cat->ne[1] ||
+                v->ne[2] != 1 || v->ne[3] != 1 || v->nb[0] != sizeof(float) || v->nb[1] != cat->nb[1] ||
+                n->src[1] == nullptr || n->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(n->src[1]) ||
+                ggml_nelements(n->src[1]) != 3*cat->ne[1]) {
+                return false;
+            }
+            cpy = n;
+        } else if (!ssm && n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
+            const ggml_tensor * wt = n->src[1];
+            if (!wt || wt->type != GGML_TYPE_F32 || wt->ne[0] != 4 || wt->nb[0] != sizeof(float) || wt->nb[1] % 16 != 0 ||
+                n->ne[1] != 1 || n->ne[2] != 1) {
+                return false;
+            }
+            ssm = n;
+        } else {
+            // any other reader of the window would see an unwritten CONCAT
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                const ggml_tensor * s = n->src[k];
+                if (s && (s == cat || s->view_src == cat)) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (!cpy || !ssm) {
+        return false;
+    }
+    ctx->conv_fold[cat] = cpy;
+    ctx->conv_fold_skip.insert(cpy);
+    return true;
+}
+
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
 
@@ -215,6 +273,16 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     // Keep the graph node for dependency construction, but do not encode a
     // second copy/scatter kernel.
     if (node->op == GGML_OP_SET_ROWS && ctx->is_fused_set_rows(node)) {
+        return 1;
+    }
+
+    // GGML_METAL_CONV_FOLD=1: a decode conv chain CONCAT(state, x) -> CPY(last d_conv-1 columns -> conv cache) ->
+    // SSM_CONV(concat) is encoded as one dispatch at the SSM_CONV (kernel_ssm_conv_fold4); the CONCAT and the CPY are
+    // skipped here, before the concurrency check, so they leave no barrier behind
+    if (ctx->conv_fold_skip.count(node)) {
+        return 1;
+    }
+    if (node->op == GGML_OP_CONCAT && ggml_metal_conv_fold_detect(ctx, idx)) {
         return 1;
     }
 
@@ -1863,6 +1931,47 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
     };
 
     const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(n_fuse > 1 ? ctx->node(idx + n_fuse - 1) : op);
+
+    // GGML_METAL_CONV_FOLD: this conv's window is a skipped CONCAT (see ggml_metal_conv_fold_detect)
+    {
+        auto it = ctx->conv_fold.find(op->src[0]);
+        if (it != ctx->conv_fold.end()) {
+            const ggml_tensor * cat = it->first;
+            const ggml_tensor * cpy = it->second;
+            const ggml_tensor * st  = cat->src[0];
+            const ggml_tensor * xx  = cat->src[1];
+
+            // the dispatch reads the CONCAT's sources and writes the CPY's destination: order it against both
+            if (!ggml_metal_op_concurrency_check(ctx, cat) || !ggml_metal_op_concurrency_check(ctx, cpy)) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
+
+            ggml_metal_kargs_ssm_conv_fold fargs = {
+                /*.nr   =*/ (int32_t) cat->ne[1],
+                /*.nbs0 =*/ st->nb[0],
+                /*.nbs1 =*/ st->nb[1],
+                /*.nbx1 =*/ xx->nb[1],
+                /*.nbw1 =*/ op->src[1]->nb[1],
+                /*.nb0  =*/ nb0,
+            };
+
+            auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_fold4(lib, use_silu);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &fargs, sizeof(fargs), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(st), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(xx), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst, 4);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cpy->src[1]), 5);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (cat->ne[1] + 255)/256, 1, 1, 256, 1, 1);
+
+            ggml_metal_op_concurrency_add(ctx, cat);
+            ggml_metal_op_concurrency_add(ctx, cpy);
+
+            return n_fuse;
+        }
+    }
 
     // GGML_METAL_SSM_CONV_ROWS=1: one thread per row (256-row threadgroups) for 1..8 tokens (decode and verify)
     static const bool rows_env = getenv("GGML_METAL_SSM_CONV_ROWS") && atoi(getenv("GGML_METAL_SSM_CONV_ROWS")) == 1;

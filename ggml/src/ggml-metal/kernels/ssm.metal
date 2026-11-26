@@ -505,3 +505,35 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
 }
+
+// GGML_METAL_CONV_FOLD=1, decode (1 token, d_conv = 4, 1 sequence): the CONCAT that builds the conv window, the CPY that
+// stores its last 3 columns back into the conv cache and the SSM_CONV (+SILU) in one dispatch, one thread per channel.
+// The window is the row the CONCAT would have written, and the dot is kernel_ssm_conv_f32_f32_4's float4 dot over it,
+// so the output matches the unfused chain bit for bit.
+kernel void kernel_ssm_conv_fold4(
+        constant ggml_metal_kargs_ssm_conv_fold & args,
+        device const char  * state,
+        device const char  * x,
+        device const char  * w,
+        device       char  * dst,
+        device       float * state_out,
+        uint tid[[thread_position_in_grid]]) {
+    if ((int) tid >= args.nr) {
+        return;
+    }
+    device const char * s = state + tid*args.nbs1;
+    const float4 win = float4(*(device const float *) (s),
+                              *(device const float *) (s + args.nbs0),
+                              *(device const float *) (s + 2*args.nbs0),
+                              *(device const float *) (x + tid*args.nbx1));
+    const float4 c = *(device const float4 *) (w + tid*args.nbw1);
+
+    float sumf = 0.0f;
+    sumf += dot(win, c);
+
+    *(device float *) (dst + tid*args.nb0) = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
+
+    state_out[3*tid + 0] = win.y;
+    state_out[3*tid + 1] = win.z;
+    state_out[3*tid + 2] = win.w;
+}
