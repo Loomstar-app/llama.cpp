@@ -1423,6 +1423,123 @@ kernel void kernel_mul_mv_pq2_0_f32(
     kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// PTQ1_0 decode, 1 row. ptq1_0_lut turns a byte into its five trits as 2-bit fields at bits 0, 2, 4, 6, 8, and a
+// field in the low bits of a half is the exact subnormal t*2^(2n-24): one and decodes a trit, two of them when two
+// bytes share a half2, and the fma converts it to fp32 for free. The floor chain of ptq1_0_dot_reg spent a multiply
+// and a floor per trit before the fma. The activations are scaled by 2^(24-2n) once per block and reused by every row.
+// The table is copied to threadgroup memory once per threadgroup. Thread it of the 8 that cover a block owns the
+// same bytes as in kernel_mul_mv_ptq1_0_f32_impl: qs[2*it], qs[2*it+1], qs[16+it] and trit it>>1 of qh[it&1].
+// It reads them with three loads and no byte loads (the half-word that holds qs[16+it], and the word at byte 24
+// that holds qh[0], qh[1] and d): byte loads made the weight reads slower than the math.
+// Threadgroups of nr0 rows split K over nsg simdgroups and add the partial sums in threadgroup memory.
+template<int nr0>
+kernel void kernel_mul_mv_ptq1_0_f32_sn(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]]) {
+    threadgroup ushort * lut  = (threadgroup ushort *) shmem;
+    threadgroup float  * sums = (threadgroup float  *) (shmem + 256*sizeof(ushort));
+
+    for (short i = tiitg; i < 256; i += 32*nsg) {
+        lut[i] = ptq1_0_lut[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int nb        = args.ne00/QK_PTQ1_0;
+    const int first_row = tgpig.x*nr0;
+
+    // 32-bit row offsets use fewer registers than nr0 pointers. Tail rows read the last row and write nothing.
+    const uint rowb = (uint) args.nb01;
+    device const char * base = src0 + (uint64_t) first_row*args.nb01;
+    const int nrow_valid = args.ne01 - first_row;
+
+    device const float * y = (device const float *) src1;
+
+    const short ix = tiisg/8;
+    const short it = tiisg%8;
+
+    // this thread's qh trit: field it>>1 of byte qh[it&1], element 120 + it
+    const short  nq = it >> 1;
+    const ushort mq = (ushort) (3u << (2*nq));
+    const float  sq = (float) (1u << (24 - 2*nq));
+
+    // c[2n+k]: element n*16 + 2*it + k (qs[2*it+k]); c[10+n]: element 80 + n*8 + it (qs[16+it]); c[15]: element 120 + it
+    float c[16];
+    float sumf[nr0] = { 0.f };
+
+    for (int ib = ix + 4*sgitg; ib < nb; ib += 4*nsg) {
+        device const float * yb = y + ib*QK_PTQ1_0;
+        float sumy = 0.f;
+
+        FOR_UNROLL (short n = 0; n < 5; n++) {
+            const float s  = (float) (1u << (24 - 2*n));
+            const float v0 = yb[n*16 + 2*it + 0];
+            const float v1 = yb[n*16 + 2*it + 1];
+            const float v2 = yb[80 + n*8 + it];
+            sumy += (v0 + v1) + v2;
+            c[2*n + 0] = v0*s;
+            c[2*n + 1] = v1*s;
+            c[10 + n]  = v2*s;
+        }
+        {
+            const float v = yb[120 + it];
+            sumy += v;
+            c[15] = v*sq;
+        }
+
+        const uint ob = (uint) ib*sizeof(block_ptq1_0);
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            device const char * pb = base + ((uint) min((int) row, nrow_valid - 1)*rowb + ob);
+
+            const ushort b01 = *((device const ushort *) (pb + 2*it));
+            const ushort b2p = *((device const ushort *) (pb + 16 + 2*(it >> 1)));
+            const uint   qx  = *((device const uint   *) (pb + 24));   // qh[0], qh[1], d
+            const uint   w01 = (uint) lut[b01 & 0xFF] | ((uint) lut[b01 >> 8] << 16);
+            const ushort w2  = lut[(b2p >> (8*(it & 1))) & 0xFF];
+            const ushort wq  = lut[(qx >> (8*(it & 1))) & 0xFF] & mq;
+
+            float acc = 0.f;
+            FOR_UNROLL (short n = 0; n < 5; n++) {
+                const half2 h01 = as_type<half2>(w01 & (0x00030003u << (2*n)));
+                const half  h2  = as_type<half>((ushort) (w2 & (3u << (2*n))));
+                acc = fma((float) h01[0], c[2*n + 0], acc);
+                acc = fma((float) h01[1], c[2*n + 1], acc);
+                acc = fma((float) h2,     c[10 + n],  acc);
+            }
+            acc = fma((float) as_type<half>(wq), c[15], acc);
+
+            sumf[row] += (float) as_type<half>((ushort) (qx >> 16)) * (acc - sumy);
+        }
+    }
+
+    FOR_UNROLL (short row = 0; row < nr0; row++) {
+        const float t = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            sums[sgitg*nr0 + row] = t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg < nr0 && first_row + tiisg < args.ne01) {
+        float t = 0.f;
+        for (short s = 0; s < nsg; s++) {
+            t += sums[s*nr0 + tiisg];
+        }
+        ((device float *) dst)[first_row + tiisg] = t;
+    }
+}
+
+typedef decltype(kernel_mul_mv_ptq1_0_f32_sn<8>) mul_mv_ptq1_0_sn_t;
+template [[host_name("kernel_mul_mv_ptq1_0_f32_sn_r4")]] kernel mul_mv_ptq1_0_sn_t kernel_mul_mv_ptq1_0_f32_sn<4>;
+template [[host_name("kernel_mul_mv_ptq1_0_f32_sn_r8")]] kernel mul_mv_ptq1_0_sn_t kernel_mul_mv_ptq1_0_f32_sn<8>;
+
 // 2-bit coefficient pre-pass (GGML_METAL_PQ2_COEF, 1..3 rows): the activations are staged once per column as base-4
 // collapse coefficients, the same float arithmetic as the stock PQ2_0 kernels at 1..3 rows.
 // Layout per column and block: [it*16 + j] the 16 base-4 collapse coefficients of thread it (il = 16*it),
